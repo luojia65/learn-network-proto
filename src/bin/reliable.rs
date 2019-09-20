@@ -74,10 +74,45 @@ pub mod network_layer {
             Reliable { input, output }
         }
 
+        pub fn into_inner(self) -> (mpsc::Receiver<Message>, mpsc::Sender<Message>) {
+            (self.input, self.output)
+        }
+
         pub fn run(&mut self) {
             loop {
                 match self.input.recv() {
                     Ok(msg) => self.output.send(msg).unwrap(),
+                    Err(_) => break,
+                }
+            }
+        } 
+    }
+
+    pub struct MayDropData {
+        input: mpsc::Receiver<Message>,
+        output: mpsc::Sender<Message>,
+        possibility: f64,
+    }
+
+    impl MayDropData {
+        pub fn new(
+            input: mpsc::Receiver<Message>, 
+            output: mpsc::Sender<Message>,
+            possibility: f64
+        ) -> Self {
+            MayDropData { input, output, possibility }
+        }
+
+        pub fn run(&mut self) {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            loop {
+                match self.input.recv() {
+                    Ok(msg) => {
+                        if rng.gen_bool(self.possibility) {
+                            self.output.send(msg).unwrap()
+                        }
+                    },
                     Err(_) => break,
                 }
             }
@@ -93,6 +128,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn main() {
     let (tx_in, rx_in) = mpsc::channel();
     let (tx_out, rx_out) = mpsc::channel();
+    let (tx_num, rx_num) = mpsc::channel();
     let mut reliable = network_layer::Reliable::new(rx_in, tx_out);
     let sender = transport_layer::Sender::new(tx_in);
     let receiver = transport_layer::Receiver::new(rx_out);
@@ -102,7 +138,7 @@ fn main() {
     let bs = bytes_sent.clone();
     thread::spawn(move || {
         let buf = [0x1u8, 0x2, 0x3];
-        for _ in 0..10 {
+        for _ in 0..rx_num.recv().unwrap() {
             let len = match sender.send(&buf) {
                 Ok(len) => len,
                 Err(e) => {
@@ -130,7 +166,16 @@ fn main() {
             // writeln!(out2.lock(), "Received {} bytes", len).unwrap();
         }
     });
+    tx_num.send(10).unwrap();
     reliable.run();
+    println!("Bytes sent: {}", bs.load(Ordering::SeqCst));
+    println!("Bytes received: {}", br.load(Ordering::SeqCst));
+    let (rx_in, tx_out) = reliable.into_inner();
+    bs.store(0, Ordering::SeqCst);
+    br.store(0, Ordering::SeqCst);
+    let mut may_drop_data = network_layer::MayDropData::new(rx_in, tx_out, 0.5);
+    tx_num.send(10).unwrap();
+    may_drop_data.run();
     println!("Bytes sent: {}", bs.load(Ordering::SeqCst));
     println!("Bytes received: {}", br.load(Ordering::SeqCst));
 }

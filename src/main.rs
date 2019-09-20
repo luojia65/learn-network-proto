@@ -64,20 +64,31 @@ pub mod network_layer {
     use std::sync::mpsc;
     use super::Message;
 
-    pub struct Reliable {
+    pub struct MayDropData {
         input: mpsc::Receiver<Message>,
         output: mpsc::Sender<Message>,
+        possibility: f64,
     }
 
-    impl Reliable {
-        pub fn new(input: mpsc::Receiver<Message>, output: mpsc::Sender<Message>) -> Self {
-            Reliable { input, output }
+    impl MayDropData {
+        pub fn new(
+            input: mpsc::Receiver<Message>, 
+            output: mpsc::Sender<Message>,
+            possibility: f64
+        ) -> Self {
+            MayDropData { input, output, possibility }
         }
 
         pub fn run(&mut self) {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
             loop {
                 match self.input.recv() {
-                    Ok(msg) => self.output.send(msg).unwrap(),
+                    Ok(msg) => {
+                        if rng.gen_bool(self.possibility) {
+                            self.output.send(msg).unwrap()
+                        }
+                    },
                     Err(_) => break,
                 }
             }
@@ -93,7 +104,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn main() {
     let (tx_in, rx_in) = mpsc::channel();
     let (tx_out, rx_out) = mpsc::channel();
-    let mut reliable = network_layer::Reliable::new(rx_in, tx_out);
+    let mut reliable = network_layer::MayDropData::new(rx_in, tx_out, 0.5);
     let sender = transport_layer::Sender::new(tx_in);
     let receiver = transport_layer::Receiver::new(rx_out);
     let out = Arc::new(std::io::stdout());
