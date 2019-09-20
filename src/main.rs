@@ -23,6 +23,11 @@ pub mod transport_layer {
         input: mpsc::Receiver<Message>,
     }
 
+    enum SenderState {
+        SendOrResend,
+        WaitingForAck,
+    }
+
     pub struct Receiver {
         input: mpsc::Receiver<Message>,
         output: mpsc::Sender<Message>,
@@ -42,9 +47,23 @@ pub mod transport_layer {
             for byte in buf {
                 sum = u8::overflowing_add(sum, *byte).0;
             }
-            self.output.send(Message::Data(buf.to_owned(), sum))
-                .or_else(|_| return Err(Error::MpscError))?;
-            Ok(len)
+            let mut state = SenderState::SendOrResend;
+            loop {
+                match state {
+                    SenderState::SendOrResend => {
+                        self.output.send(Message::Data(buf.to_owned(), sum))
+                            .or_else(|_| return Err(Error::MpscError))?;
+                        state = SenderState::WaitingForAck;
+                    },
+                    SenderState::WaitingForAck => {
+                        match self.input.recv().unwrap() {
+                            Message::Ack => return Ok(len),
+                            Message::Nack => state = SenderState::SendOrResend,
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
 
         pub fn simulation_end(&self) {
@@ -61,18 +80,29 @@ pub mod transport_layer {
         }
 
         pub fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-            let len = match self.input.recv() {
-                Ok(Message::Data(src, _sum)) => {
-                    let len = usize::min(src.len(), buf.len());
-                    for i in 0..len {
-                        buf[i] = src[i]
-                    };
-                    len
-                },
-                Ok(_) => 0,
-                Err(_) => return Err(Error::MpscError)
-            };
-            Ok(len)
+            let buf_len = buf.len();
+            loop {
+                match self.input.recv() {
+                    Ok(Message::Data(src, received_sum)) => {
+                        let len = usize::min(src.len(), buf_len);
+                        let mut sum = 0;
+                        for byte in &src {
+                            sum = u8::overflowing_add(sum, *byte).0;
+                        }
+                        if sum == received_sum {
+                            for i in 0..len {
+                                buf[i] = src[i]
+                            };
+                            self.output.send(Message::Ack).unwrap();
+                            return Ok(len)
+                        } else {
+                            self.output.send(Message::Nack).unwrap();
+                        }
+                    },
+                    Ok(_) => return Ok(0),
+                    Err(_) => return Err(Error::MpscError)
+                };
+            }
         }
     }
 }
@@ -157,7 +187,7 @@ fn main() {
     let sender = transport_layer::Sender::new(tx_send, rx_send);
     let receiver = transport_layer::Receiver::new(rx_recv, tx_recv);
     let out = Arc::new(std::io::stdout());
-    // let out2 = out.clone();
+    let out2 = out.clone();
     let bytes_sent = Arc::new(AtomicUsize::new(0));
     let bs = bytes_sent.clone();
     let packets_sent = Arc::new(AtomicUsize::new(0));
@@ -175,7 +205,7 @@ fn main() {
             };
             bytes_sent.fetch_add(len, Ordering::SeqCst);
             packets_sent.fetch_add(1, Ordering::SeqCst);
-            // writeln!(out.lock(), "Sent {} bytes", len).unwrap();
+            writeln!(out.lock(), "Sent {} bytes", len).unwrap();
         }
         sender.simulation_end();
     });
@@ -197,7 +227,7 @@ fn main() {
                 packets_recv_okay.fetch_add(1, Ordering::SeqCst);
             } 
             bytes_recv.fetch_add(len, Ordering::SeqCst);
-            // writeln!(out2.lock(), "Received {} bytes", len).unwrap();
+            writeln!(out2.lock(), "Received {} bytes", len).unwrap();
         }
     });
     reliable.run();
