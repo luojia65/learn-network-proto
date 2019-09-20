@@ -206,10 +206,10 @@ fn main() {
     let bs = bytes_sent.clone();
     let packets_sent = Arc::new(AtomicUsize::new(0));
     let ps = packets_sent.clone();
-    let correct_buf = [0x1u8, 0x2, 0x3];
+    let correct_buf = vec![0x66u8; 100];
     thread::spawn(move || {
-        let buf = [0x1u8, 0x2, 0x3];
-        for _ in 0..10 {
+        let buf = vec![0x66u8; 100];
+        for _ in 0..1000 {
             let len = match sender.send(&buf) {
                 Ok(len) => len,
                 Err(e) => {
@@ -237,7 +237,8 @@ fn main() {
                     break
                 },
             };
-            if buf[..len] == correct_buf {
+            let buf = Vec::from(&buf[..len]);
+            if buf == correct_buf {
                 packets_recv_okay.fetch_add(1, Ordering::SeqCst);
             } 
             bytes_recv.fetch_add(len, Ordering::SeqCst);
