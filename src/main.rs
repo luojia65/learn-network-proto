@@ -3,7 +3,7 @@ use std::sync::mpsc;
 pub enum Message {
     Data(Vec<u8>, u8),
     Ack,
-    Nack,
+    Nack(u8),
     SimulationEnd,
 }
 
@@ -21,6 +21,7 @@ pub mod transport_layer {
     pub struct Sender {
         output: mpsc::Sender<Message>,
         input: mpsc::Receiver<Message>,
+        cur_seq_id: u8,
     }
 
     enum SenderState {
@@ -31,6 +32,7 @@ pub mod transport_layer {
     pub struct Receiver {
         input: mpsc::Receiver<Message>,
         output: mpsc::Sender<Message>,
+        cur_seq_id: u8,
     }
 
     impl Sender {
@@ -38,10 +40,10 @@ pub mod transport_layer {
             output: mpsc::Sender<Message>,
             input: mpsc::Receiver<Message>,
         ) -> Self {
-            Sender { output, input }
+            Sender { output, input, cur_seq_id: 0 }
         }
 
-        pub fn send(&self, buf: &[u8]) -> Result<usize> {
+        pub fn send(&mut self, buf: &[u8]) -> Result<usize> {
             let len = buf.len();
             let mut sum = 0;
             for byte in buf {
@@ -57,8 +59,13 @@ pub mod transport_layer {
                     },
                     SenderState::WaitingForAck => {
                         match self.input.recv().unwrap() {
-                            Message::Ack => return Ok(len),
-                            Message::Nack => state = SenderState::SendOrResend,
+                            Message::Ack => {
+                                self.cur_seq_id = 1 - self.cur_seq_id;
+                                return Ok(len)
+                            },
+                            Message::Nack(seq_id) if seq_id == self.cur_seq_id => {
+                                state = SenderState::SendOrResend
+                            },
                             _ => {}
                         }
                     }
@@ -76,10 +83,10 @@ pub mod transport_layer {
             input: mpsc::Receiver<Message>,
             output: mpsc::Sender<Message>,
         ) -> Self {
-            Receiver { input, output }
+            Receiver { input, output, cur_seq_id: 0 }
         }
 
-        pub fn recv(&self, buf: &mut [u8]) -> Result<usize> {
+        pub fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
             let buf_len = buf.len();
             loop {
                 match self.input.recv() {
@@ -89,14 +96,16 @@ pub mod transport_layer {
                         for byte in &src {
                             sum = u8::overflowing_add(sum, *byte).0;
                         }
-                        if sum == received_sum {
+                        let not_corrupt = sum != received_sum;
+                        if not_corrupt {
                             for i in 0..len {
                                 buf[i] = src[i]
                             };
                             self.output.send(Message::Ack).unwrap();
+                            self.cur_seq_id = 1 - self.cur_seq_id;
                             return Ok(len)
                         } else {
-                            self.output.send(Message::Nack).unwrap();
+                            self.output.send(Message::Nack(self.cur_seq_id)).unwrap();
                         }
                     },
                     Ok(_) => return Ok(0),
@@ -159,7 +168,7 @@ pub mod network_layer {
                             msg[index] ^= mask;
                         }
                     }
-                    self.byte_counter.1 += 1 + msg.len() + 1 /* id + len + checksum */;
+                    self.byte_counter.1 += 1 + msg.len() + 1 /* type + len + checksum */;
                     self.recv_out.send(Message::Data(msg, sum)).unwrap()
                 },
                 Ok(Message::SimulationEnd) => return true,
@@ -168,14 +177,14 @@ pub mod network_layer {
                 Err(_) => return false,
             }
             match self.recv_in.try_recv() {
-                Ok(Message::Data(_, _)) => {},
+                Ok(Message::Data(..)) => {},
                 Ok(Message::Ack) => { 
                     self.byte_counter.0 += 1;
                     self.send_out.send(Message::Ack).unwrap() 
                 },
-                Ok(Message::Nack) => { 
+                Ok(Message::Nack(id)) => { 
                     self.byte_counter.0 += 1;
-                    self.send_out.send(Message::Nack).unwrap() 
+                    self.send_out.send(Message::Nack(id)).unwrap() 
                 },
                 Ok(m) => self.send_out.send(m).unwrap(),
                 Err(mpsc::TryRecvError::Empty) => {},
@@ -198,8 +207,8 @@ fn main() {
     let (tx_recv, rx_out) = mpsc::channel();
     let (tx_out, rx_recv) = mpsc::channel();
     let mut bit_error = network_layer::BitError::new(rx_in, tx_out, tx_in, rx_out, 0.5);
-    let sender = transport_layer::Sender::new(tx_send, rx_send);
-    let receiver = transport_layer::Receiver::new(rx_recv, tx_recv);
+    let mut sender = transport_layer::Sender::new(tx_send, rx_send);
+    let mut receiver = transport_layer::Receiver::new(rx_recv, tx_recv);
     let out = Arc::new(std::io::stdout());
     // let out2 = out.clone();
     let bytes_sent = Arc::new(AtomicUsize::new(0));
