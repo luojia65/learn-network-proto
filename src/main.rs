@@ -4,6 +4,7 @@ pub enum Message {
     Data(Vec<u8>, u8),
     Ack,
     Nack,
+    SimulationEnd,
 }
 
 pub mod transport_layer {
@@ -18,16 +19,21 @@ pub mod transport_layer {
     pub type Result<T> = core::result::Result<T, Error>;
 
     pub struct Sender {
-        sender: mpsc::Sender<Message>,
+        output: mpsc::Sender<Message>,
+        input: mpsc::Receiver<Message>,
     }
 
     pub struct Receiver {
-        receiver: mpsc::Receiver<Message>,
+        input: mpsc::Receiver<Message>,
+        output: mpsc::Sender<Message>,
     }
 
     impl Sender {
-        pub fn new(sender: mpsc::Sender<Message>) -> Self {
-            Sender { sender }
+        pub fn new(
+            output: mpsc::Sender<Message>,
+            input: mpsc::Receiver<Message>,
+        ) -> Self {
+            Sender { output, input }
         }
 
         pub fn send(&self, buf: &[u8]) -> Result<usize> {
@@ -36,19 +42,26 @@ pub mod transport_layer {
             for byte in buf {
                 sum = u8::overflowing_add(sum, *byte).0;
             }
-            self.sender.send(Message::Data(buf.to_owned(), sum))
+            self.output.send(Message::Data(buf.to_owned(), sum))
                 .or_else(|_| return Err(Error::MpscError))?;
             Ok(len)
+        }
+
+        pub fn simulation_end(&self) {
+            self.output.send(Message::SimulationEnd).unwrap();
         }
     }
 
     impl Receiver {
-        pub fn new(receiver: mpsc::Receiver<Message>) -> Self {
-            Receiver { receiver }
+        pub fn new(
+            input: mpsc::Receiver<Message>,
+            output: mpsc::Sender<Message>,
+        ) -> Self {
+            Receiver { input, output }
         }
 
         pub fn recv(&self, buf: &mut [u8]) -> Result<usize> {
-            let len = match self.receiver.recv() {
+            let len = match self.input.recv() {
                 Ok(Message::Data(src, _sum)) => {
                     let len = usize::min(src.len(), buf.len());
                     for i in 0..len {
@@ -69,43 +82,64 @@ pub mod network_layer {
     use super::Message;
 
     pub struct BitError {
-        input: mpsc::Receiver<Message>,
-        output: mpsc::Sender<Message>,
+        send_in: mpsc::Receiver<Message>, 
+        recv_out: mpsc::Sender<Message>,
+        send_out: mpsc::Sender<Message>,
+        recv_in: mpsc::Receiver<Message>, 
         possibility: f64,
     }
 
     impl BitError {
         pub fn new(
-            input: mpsc::Receiver<Message>, 
-            output: mpsc::Sender<Message>,
+            send_in: mpsc::Receiver<Message>, 
+            recv_out: mpsc::Sender<Message>,
+            send_out: mpsc::Sender<Message>,
+            recv_in: mpsc::Receiver<Message>, 
             possibility: f64
         ) -> Self {
-            BitError { input, output, possibility }
+            BitError { send_in, recv_out, send_out, recv_in, possibility }
         }
 
         pub fn run(&mut self) {
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
             loop {
-                match self.input.recv() {
-                    Ok(Message::Data(mut msg, mut sum)) => {
-                        if rng.gen_bool(self.possibility) {
-                            let index = rng.gen_range(0, msg.len() + 1);
-                            let bit_index = rng.gen_range(0, 8);
-                            let mask = !(1 << bit_index); 
-                            if index == msg.len() {
-                                sum ^= mask;
-                            } else {
-                                msg[index] ^= mask;
-                            }
-                        }
-                        self.output.send(Message::Data(msg, sum)).unwrap()
-                    },
-                    Ok(_) => {}
-                    Err(_) => break,
+                let should_break = self.process();
+                if should_break {
+                    return;
                 }
             }
         } 
+
+        fn process(&mut self) -> bool {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            match self.send_in.try_recv() {
+                Ok(Message::Data(mut msg, mut sum)) => {
+                    if rng.gen_bool(self.possibility) {
+                        let index = rng.gen_range(0, msg.len() + 1);
+                        let bit_index = rng.gen_range(0, 8);
+                        let mask = !(1 << bit_index); 
+                        if index == msg.len() {
+                            sum ^= mask;
+                        } else {
+                            msg[index] ^= mask;
+                        }
+                    }
+                    self.recv_out.send(Message::Data(msg, sum)).unwrap()
+                },
+                Ok(Message::SimulationEnd) => return true,
+                Ok(_) => {},
+                Err(mpsc::TryRecvError::Empty) => {},
+                Err(_) => return false,
+            }
+            match self.recv_in.try_recv() {
+                Ok(Message::Data(_, _)) => {}
+                Ok(m) => self.send_out.send(m).unwrap(),
+                Err(mpsc::TryRecvError::Empty) => {},
+                Err(_) => return false,
+            }
+            return false;
+        }
+
     }
 }
 
@@ -115,11 +149,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn main() {
-    let (tx_in, rx_in) = mpsc::channel();
-    let (tx_out, rx_out) = mpsc::channel();
-    let mut reliable = network_layer::BitError::new(rx_in, tx_out, 0.5);
-    let sender = transport_layer::Sender::new(tx_in);
-    let receiver = transport_layer::Receiver::new(rx_out);
+    let (tx_send, rx_in) = mpsc::channel();
+    let (tx_in, rx_send) = mpsc::channel();
+    let (tx_recv, rx_out) = mpsc::channel();
+    let (tx_out, rx_recv) = mpsc::channel();
+    let mut reliable = network_layer::BitError::new(rx_in, tx_out, tx_in, rx_out, 0.5);
+    let sender = transport_layer::Sender::new(tx_send, rx_send);
+    let receiver = transport_layer::Receiver::new(rx_recv, tx_recv);
     let out = Arc::new(std::io::stdout());
     // let out2 = out.clone();
     let bytes_sent = Arc::new(AtomicUsize::new(0));
@@ -141,6 +177,7 @@ fn main() {
             packets_sent.fetch_add(1, Ordering::SeqCst);
             // writeln!(out.lock(), "Sent {} bytes", len).unwrap();
         }
+        sender.simulation_end();
     });
     let bytes_recv = Arc::new(AtomicUsize::new(0));
     let br = bytes_recv.clone();
