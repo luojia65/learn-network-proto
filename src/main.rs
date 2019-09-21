@@ -57,17 +57,15 @@ pub mod transport_layer {
                             .or_else(|_| return Err(Error::MpscError))?;
                         state = SenderState::WaitingForAck;
                     },
-                    SenderState::WaitingForAck => {
-                        match self.input.recv().unwrap() {
-                            Message::Ack => {
-                                self.cur_seq_id = 1 - self.cur_seq_id;
-                                return Ok(len)
-                            },
-                            Message::Nack(seq_id) if seq_id == self.cur_seq_id => {
-                                state = SenderState::SendOrResend
-                            },
-                            _ => {}
-                        }
+                    SenderState::WaitingForAck => match self.input.recv().unwrap() {
+                        Message::Ack => {
+                            self.cur_seq_id = 1 - self.cur_seq_id;
+                            return Ok(len)
+                        },
+                        Message::Nack(seq_id) if seq_id == self.cur_seq_id => {
+                            state = SenderState::SendOrResend
+                        },
+                        _ => {}
                     }
                 }
             }
@@ -96,7 +94,7 @@ pub mod transport_layer {
                         for byte in &src {
                             sum = u8::overflowing_add(sum, *byte).0;
                         }
-                        let not_corrupt = sum != received_sum;
+                        let not_corrupt = sum == received_sum;
                         if not_corrupt {
                             for i in 0..len {
                                 buf[i] = src[i]
@@ -171,6 +169,7 @@ pub mod network_layer {
                     self.byte_counter.1 += 1 + msg.len() + 1 /* type + len + checksum */;
                     self.recv_out.send(Message::Data(msg, sum)).unwrap()
                 },
+                Ok(Message::Ack ) => {},
                 Ok(Message::SimulationEnd) => return true,
                 Ok(_) => {},
                 Err(mpsc::TryRecvError::Empty) => {},
